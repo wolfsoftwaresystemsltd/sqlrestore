@@ -84,9 +84,9 @@ fn run() -> std::io::Result<()> {
         if !args.password.is_empty() {
             cmd.env("MYSQL_PWD", &args.password);
         }
-        let mut c = cmd.spawn().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("spawn {}: {e}", args.client))
-        })?;
+        let mut c = cmd
+            .spawn()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {}: {e}", args.client)))?;
         let stdin = c.stdin.take().expect("stdin piped");
         child = Some(c);
         Box::new(BufWriter::with_capacity(BUF, stdin))
@@ -196,7 +196,10 @@ fn run() -> std::io::Result<()> {
     if !missing.is_empty() {
         let mut m: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
         m.sort();
-        eprintln!("warning: --exclude listed tables not found in dump: {}", m.join(", "));
+        eprintln!(
+            "warning: --exclude listed tables not found in dump: {}",
+            m.join(", ")
+        );
     }
 
     Ok(())
