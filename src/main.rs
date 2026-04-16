@@ -6,14 +6,26 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+const BANNER: &str = r#"
+   /\___/\
+  /       \      sqlrestore v{VERSION}
+ |  o   o  |     By Wolf Software Systems Ltd
+  \   ^   /      https://wolf.uk.com
+   \_____/
+"#;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "sqlrestore",
+    version,
     about = "Fast MariaDB/MySQL dump restore with table exclusion",
     long_about = "Streams a mysqldump .sql (or .sql.gz) file into the mariadb client, \
                   skipping structure and data for any tables named via --exclude."
 )]
 struct Args {
+    /// Suppress the startup banner
+    #[arg(long, global = true)]
+    quiet: bool,
     /// Database user
     user: String,
     /// Database password ("" for none)
@@ -59,6 +71,9 @@ fn main() {
 
 fn run() -> std::io::Result<()> {
     let args = Args::parse();
+    if !args.quiet {
+        eprintln!("{}", BANNER.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
+    }
     let excluded: HashSet<String> = args.exclude.iter().map(|s| s.to_lowercase()).collect();
 
     let file = File::open(&args.file)
