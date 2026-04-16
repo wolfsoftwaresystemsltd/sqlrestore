@@ -37,6 +37,10 @@ struct Args {
     /// Comma-separated list of tables to exclude (case-insensitive)
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
+    /// Restore only this database from the dump; drops CREATE DATABASE/USE
+    /// blocks for all others (case-insensitive)
+    #[arg(long)]
+    only_database: Option<String>,
     /// Database host
     #[arg(long, short = 'H', default_value = "localhost")]
     host: String,
@@ -78,6 +82,7 @@ fn run() -> std::io::Result<()> {
         eprintln!("{}", BANNER.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
     }
     let excluded: HashSet<String> = args.exclude.iter().map(|s| s.to_lowercase()).collect();
+    let only_db: Option<String> = args.only_database.as_ref().map(|s| s.to_lowercase());
 
     let file = File::open(&args.file)
         .map_err(|e| std::io::Error::new(e.kind(), format!("open {}: {e}", args.file)))?;
@@ -115,6 +120,7 @@ fn run() -> std::io::Result<()> {
 
     let mut seen_tables: HashSet<String> = HashSet::new();
     let mut skipped_tables: HashSet<String> = HashSet::new();
+    let mut seen_databases: HashSet<String> = HashSet::new();
     let started = Instant::now();
     let mut bytes_in: u64 = 0;
     let mut bytes_out: u64 = 0;
@@ -131,6 +137,7 @@ fn run() -> std::io::Result<()> {
         }
 
         let mut skipping = false;
+        let mut db_skipping = false;
         let mut line: Vec<u8> = Vec::with_capacity(64 << 10);
         let progress_step = args.progress_mib.saturating_mul(1 << 20);
         let mut next_progress = progress_step;
@@ -145,12 +152,24 @@ fn run() -> std::io::Result<()> {
 
             if line.starts_with(b"-- ") {
                 match parse_marker(&line) {
+                    Marker::Database(name) => {
+                        seen_databases.insert(name.clone());
+                        skipping = false;
+                        db_skipping = match &only_db {
+                            Some(want) => name.to_ascii_lowercase() != *want,
+                            None => false,
+                        };
+                    }
                     Marker::Table(name) => {
-                        seen_tables.insert(name.clone());
+                        if !db_skipping {
+                            seen_tables.insert(name.clone());
+                        }
                         let lower = name.to_ascii_lowercase();
                         if excluded.contains(&lower) {
                             skipping = true;
-                            skipped_tables.insert(name);
+                            if !db_skipping {
+                                skipped_tables.insert(name);
+                            }
                         } else {
                             skipping = false;
                         }
@@ -162,7 +181,7 @@ fn run() -> std::io::Result<()> {
                 }
             }
 
-            if !skipping {
+            if !skipping && !db_skipping {
                 writer.write_all(&line)?;
                 bytes_out += n as u64;
             }
@@ -237,16 +256,43 @@ fn run() -> std::io::Result<()> {
         );
     }
 
+    if let Some(want) = &only_db {
+        if !seen_databases
+            .iter()
+            .any(|d| d.to_ascii_lowercase() == *want)
+        {
+            let mut dbs: Vec<&str> = seen_databases.iter().map(|s| s.as_str()).collect();
+            dbs.sort();
+            eprintln!(
+                "warning: --only-database {:?} not found in dump (databases seen: {})",
+                args.only_database.as_deref().unwrap_or(""),
+                if dbs.is_empty() {
+                    "<none — dump has no `-- Current Database:` markers>".to_string()
+                } else {
+                    dbs.join(", ")
+                }
+            );
+        }
+    }
+
     Ok(())
 }
 
 enum Marker {
+    Database(String),
     Table(String),
     Other,
     Border,
 }
 
 fn parse_marker(line: &[u8]) -> Marker {
+    let db_prefix: &[u8] = b"-- Current Database: `";
+    if line.starts_with(db_prefix) {
+        let rest = &line[db_prefix.len()..];
+        if let Some(end) = rest.iter().position(|&c| c == b'`') {
+            return Marker::Database(String::from_utf8_lossy(&rest[..end]).into_owned());
+        }
+    }
     let prefixes: [&[u8]; 4] = [
         b"-- Table structure for table `",
         b"-- Dumping data for table `",
