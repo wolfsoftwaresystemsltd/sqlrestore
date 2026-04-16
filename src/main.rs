@@ -49,6 +49,9 @@ struct Args {
     /// Extra args to pass to the client (quoted, comma-separated)
     #[arg(long, value_delimiter = ',')]
     client_arg: Vec<String>,
+    /// Disable SSL (passes --ssl=0 to the client)
+    #[arg(long)]
+    no_ssl: bool,
     /// Don't pipe to a client — write filtered SQL to stdout
     #[arg(long)]
     dry_run: bool,
@@ -92,8 +95,11 @@ fn run() -> std::io::Result<()> {
         let mut cmd = Command::new(&args.client);
         cmd.arg(format!("-u{}", args.user))
             .arg(format!("-h{}", args.host))
-            .arg(format!("-P{}", args.port))
-            .args(&args.client_arg)
+            .arg(format!("-P{}", args.port));
+        if args.no_ssl {
+            cmd.arg("--ssl=0");
+        }
+        cmd.args(&args.client_arg)
             .arg(&args.database)
             .stdin(Stdio::piped());
         if !args.password.is_empty() {
@@ -107,88 +113,102 @@ fn run() -> std::io::Result<()> {
         Box::new(BufWriter::with_capacity(BUF, stdin))
     };
 
-    if !args.no_tune {
-        writer.write_all(
-            b"/* sqlrestore: speed tuning */\n\
-              SET @OLD_AUTOCOMMIT=@@AUTOCOMMIT, AUTOCOMMIT=0;\n\
-              SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0;\n\
-              SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\
-              SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0;\n",
-        )?;
-    }
-
-    let mut skipping = false;
-    let mut line: Vec<u8> = Vec::with_capacity(64 << 10);
     let mut seen_tables: HashSet<String> = HashSet::new();
     let mut skipped_tables: HashSet<String> = HashSet::new();
     let started = Instant::now();
     let mut bytes_in: u64 = 0;
     let mut bytes_out: u64 = 0;
-    let progress_step = args.progress_mib.saturating_mul(1 << 20);
-    let mut next_progress = progress_step;
 
-    loop {
-        line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            break;
+    let result: std::io::Result<()> = (|| {
+        if !args.no_tune {
+            writer.write_all(
+                b"/* sqlrestore: speed tuning */\n\
+                  SET @OLD_AUTOCOMMIT=@@AUTOCOMMIT, AUTOCOMMIT=0;\n\
+                  SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0;\n\
+                  SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0;\n\
+                  SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0;\n",
+            )?;
         }
-        bytes_in += n as u64;
 
-        if line.starts_with(b"-- ") {
-            match parse_marker(&line) {
-                Marker::Table(name) => {
-                    seen_tables.insert(name.clone());
-                    let lower = name.to_ascii_lowercase();
-                    if excluded.contains(&lower) {
-                        skipping = true;
-                        skipped_tables.insert(name);
-                    } else {
+        let mut skipping = false;
+        let mut line: Vec<u8> = Vec::with_capacity(64 << 10);
+        let progress_step = args.progress_mib.saturating_mul(1 << 20);
+        let mut next_progress = progress_step;
+
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            bytes_in += n as u64;
+
+            if line.starts_with(b"-- ") {
+                match parse_marker(&line) {
+                    Marker::Table(name) => {
+                        seen_tables.insert(name.clone());
+                        let lower = name.to_ascii_lowercase();
+                        if excluded.contains(&lower) {
+                            skipping = true;
+                            skipped_tables.insert(name);
+                        } else {
+                            skipping = false;
+                        }
+                    }
+                    Marker::Other => {
                         skipping = false;
                     }
+                    Marker::Border => {}
                 }
-                Marker::Other => {
-                    skipping = false;
-                }
-                Marker::Border => {}
+            }
+
+            if !skipping {
+                writer.write_all(&line)?;
+                bytes_out += n as u64;
+            }
+
+            if progress_step > 0 && bytes_in >= next_progress {
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                eprintln!(
+                    "  {} MiB read, {:.1} MiB/s",
+                    bytes_in / (1 << 20),
+                    (bytes_in as f64 / 1_048_576.0) / secs
+                );
+                next_progress = next_progress.saturating_add(progress_step);
             }
         }
 
-        if !skipping {
-            writer.write_all(&line)?;
-            bytes_out += n as u64;
+        if !args.no_tune {
+            writer.write_all(
+                b"COMMIT;\n\
+                  SET AUTOCOMMIT=@OLD_AUTOCOMMIT;\n\
+                  SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;\n\
+                  SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n\
+                  SET SQL_NOTES=@OLD_SQL_NOTES;\n",
+            )?;
         }
-
-        if progress_step > 0 && bytes_in >= next_progress {
-            let secs = started.elapsed().as_secs_f64().max(0.001);
-            eprintln!(
-                "  {} MiB read, {:.1} MiB/s",
-                bytes_in / (1 << 20),
-                (bytes_in as f64 / 1_048_576.0) / secs
-            );
-            next_progress = next_progress.saturating_add(progress_step);
-        }
-    }
-
-    if !args.no_tune {
-        writer.write_all(
-            b"COMMIT;\n\
-              SET AUTOCOMMIT=@OLD_AUTOCOMMIT;\n\
-              SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS;\n\
-              SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;\n\
-              SET SQL_NOTES=@OLD_SQL_NOTES;\n",
-        )?;
-    }
-    writer.flush()?;
+        writer.flush()
+    })();
     drop(writer);
 
     if let Some(mut c) = child {
         let status = c.wait()?;
+        match (&result, status.success()) {
+            (Err(e), false) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Err(std::io::Error::other(format!(
+                    "client exited early with {status}"
+                )));
+            }
+            _ => {}
+        }
+        result?;
         if !status.success() {
             return Err(std::io::Error::other(format!(
                 "client exited with {status}"
             )));
         }
+    } else {
+        result?;
     }
 
     let elapsed = started.elapsed();
