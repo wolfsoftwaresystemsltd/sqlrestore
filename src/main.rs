@@ -37,10 +37,11 @@ struct Args {
     /// Comma-separated list of tables to exclude (case-insensitive)
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
-    /// Restore only this database from the dump; drops CREATE DATABASE/USE
-    /// blocks for all others (case-insensitive)
-    #[arg(long)]
-    only_database: Option<String>,
+    /// Restore only these databases from the dump (comma-separated, or repeat
+    /// the flag); drops CREATE DATABASE/USE blocks for all others
+    /// (case-insensitive)
+    #[arg(long, value_delimiter = ',')]
+    only_database: Vec<String>,
     /// Database host
     #[arg(long, short = 'H', default_value = "localhost")]
     host: String,
@@ -56,6 +57,11 @@ struct Args {
     /// Disable SSL (passes --ssl=0 to the client)
     #[arg(long)]
     no_ssl: bool,
+    /// Set --max-allowed-packet on the client (e.g. 256M, 1G). Fix for
+    /// "ERROR 2006: Server has gone away". The server's own max_allowed_packet
+    /// may also need raising in my.cnf.
+    #[arg(long, value_name = "SIZE")]
+    max_packet: Option<String>,
     /// Don't pipe to a client — write filtered SQL to stdout
     #[arg(long)]
     dry_run: bool,
@@ -82,7 +88,7 @@ fn run() -> std::io::Result<()> {
         eprintln!("{}", BANNER.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
     }
     let excluded: HashSet<String> = args.exclude.iter().map(|s| s.to_lowercase()).collect();
-    let only_db: Option<String> = args.only_database.as_ref().map(|s| s.to_lowercase());
+    let only_dbs: HashSet<String> = args.only_database.iter().map(|s| s.to_lowercase()).collect();
 
     let file = File::open(&args.file)
         .map_err(|e| std::io::Error::new(e.kind(), format!("open {}: {e}", args.file)))?;
@@ -103,6 +109,9 @@ fn run() -> std::io::Result<()> {
             .arg(format!("-P{}", args.port));
         if args.no_ssl {
             cmd.arg("--ssl=0");
+        }
+        if let Some(mp) = &args.max_packet {
+            cmd.arg(format!("--max-allowed-packet={mp}"));
         }
         cmd.args(&args.client_arg)
             .arg(&args.database)
@@ -155,9 +164,10 @@ fn run() -> std::io::Result<()> {
                     Marker::Database(name) => {
                         seen_databases.insert(name.clone());
                         skipping = false;
-                        db_skipping = match &only_db {
-                            Some(want) => name.to_ascii_lowercase() != *want,
-                            None => false,
+                        db_skipping = if only_dbs.is_empty() {
+                            false
+                        } else {
+                            !only_dbs.contains(&name.to_ascii_lowercase())
                         };
                     }
                     Marker::Table(name) => {
@@ -256,16 +266,23 @@ fn run() -> std::io::Result<()> {
         );
     }
 
-    if let Some(want) = &only_db {
-        if !seen_databases
+    if !only_dbs.is_empty() {
+        let seen_lower: HashSet<String> = seen_databases
             .iter()
-            .any(|d| d.to_ascii_lowercase() == *want)
-        {
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+        let mut missing_dbs: Vec<&str> = only_dbs
+            .iter()
+            .filter(|d| !seen_lower.contains(*d))
+            .map(|s| s.as_str())
+            .collect();
+        if !missing_dbs.is_empty() {
+            missing_dbs.sort();
             let mut dbs: Vec<&str> = seen_databases.iter().map(|s| s.as_str()).collect();
             dbs.sort();
             eprintln!(
                 "warning: --only-database {:?} not found in dump (databases seen: {})",
-                args.only_database.as_deref().unwrap_or(""),
+                missing_dbs.join(","),
                 if dbs.is_empty() {
                     "<none — dump has no `-- Current Database:` markers>".to_string()
                 } else {
